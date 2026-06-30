@@ -7,54 +7,48 @@ import (
 	"strings"
 )
 
-type server struct {
+type appServer struct {
 	cfg *Config
 	mux *http.ServeMux
 }
 
 func newServer(cfg *Config) http.Handler {
-	s := &server{cfg: cfg, mux: http.NewServeMux()}
+	s := &appServer{cfg: cfg, mux: http.NewServeMux()}
 	s.mux.HandleFunc("/", s.handleIndex)
 	s.mux.HandleFunc("/api/peers", s.handlePeers)
 	s.mux.HandleFunc("/api/peers/", s.handlePeer)
 	s.mux.HandleFunc("/api/generate", s.handleGenerate)
-	s.mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(200)
-	})
+	s.mux.HandleFunc("/api/suggest-ip", s.handleSuggestIP)
+	s.mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(200) })
 	if cfg.Auth.Username != "" {
 		return basicAuth(cfg.Auth.Username, cfg.Auth.Password, s.mux)
 	}
 	return s.mux
 }
 
-func (s *server) handleIndex(w http.ResponseWriter, r *http.Request) {
-	iface, peers, _ := readConfig(s.cfg.WgConfig)
-	peers = liveStats(s.cfg.Interface, peers)
-
-	online := 0
-	for _, p := range peers {
-		if p.Online {
-			online++
-		}
+func (s *appServer) handleIndex(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path != "/" {
+		http.NotFound(w, r)
+		return
 	}
+	iface, _, _ := readConfig(s.cfg.WgConfig)
 
-	data := map[string]any{
-		"Interface": s.cfg.Interface,
-		"Peers":     peers,
-		"Total":     len(peers),
-		"Online":    online,
-		"ServerPub": "",
-	}
+	serverPub := ""
 	if iface != nil {
-		data["ServerPub"] = iface.PublicKey
-		data["ServerAddr"] = iface.Address
+		serverPub = iface.PublicKey
 	}
 
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	renderHTML(w, data)
+	renderHTML(w, map[string]any{
+		"Interface":      s.cfg.Interface,
+		"ServerPub":      serverPub,
+		"DefaultIPs":     s.cfg.Defaults.AllowedIPs,
+		"ServerEndpoint": s.cfg.Server.Endpoint,
+		"ServerDNS":      s.cfg.Server.DNS,
+	})
 }
 
-func (s *server) handlePeers(w http.ResponseWriter, r *http.Request) {
+func (s *appServer) handlePeers(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 
 	switch r.Method {
@@ -65,17 +59,25 @@ func (s *server) handlePeers(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		peers = liveStats(s.cfg.Interface, peers)
+		for i := range peers {
+			_, peers[i].HasConfig = cfgStore.Get(peers[i].PublicKey)
+		}
 		json.NewEncoder(w).Encode(peers)
 
 	case http.MethodPost:
 		var req struct {
-			Name       string `json:"name"`
-			PublicKey  string `json:"public_key"`
+			Name         string `json:"name"`
+			PublicKey    string `json:"public_key"`
 			PresharedKey string `json:"preshared_key"`
-			AllowedIPs string `json:"allowed_ips"`
+			AllowedIPs   string `json:"allowed_ips"`
+			ClientConfig string `json:"client_config"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			jsonErr(w, err, 400)
+			return
+		}
+		if req.PublicKey == "" {
+			jsonErr(w, fmt.Errorf("public_key is required"), 400)
 			return
 		}
 		if req.AllowedIPs == "" {
@@ -85,6 +87,9 @@ func (s *server) handlePeers(w http.ResponseWriter, r *http.Request) {
 			jsonErr(w, err, 500)
 			return
 		}
+		if req.ClientConfig != "" {
+			cfgStore.Set(req.PublicKey, req.ClientConfig)
+		}
 		w.WriteHeader(201)
 		json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
 
@@ -93,21 +98,27 @@ func (s *server) handlePeers(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func (s *server) handlePeer(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "application/json")
+func (s *appServer) handlePeer(w http.ResponseWriter, r *http.Request) {
 	parts := strings.Split(strings.TrimPrefix(r.URL.Path, "/api/peers/"), "/")
 	pubkey := parts[0]
-
-	if len(parts) == 2 && parts[1] == "qr" {
-		s.handleQR(w, r, pubkey)
+	if pubkey == "" {
+		w.WriteHeader(400)
 		return
 	}
-	if len(parts) == 2 && parts[1] == "config" {
-		s.handlePeerConfig(w, r, pubkey)
-		return
+
+	if len(parts) == 2 {
+		switch parts[1] {
+		case "qr":
+			s.handleQR(w, pubkey)
+			return
+		case "config":
+			s.handlePeerConfig(w, pubkey)
+			return
+		}
 	}
 
 	if r.Method == http.MethodDelete {
+		w.Header().Set("Content-Type", "application/json")
 		if err := removePeer(s.cfg.WgConfig, pubkey); err != nil {
 			jsonErr(w, err, 500)
 			return
@@ -118,14 +129,16 @@ func (s *server) handlePeer(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(405)
 }
 
-func (s *server) handleQR(w http.ResponseWriter, r *http.Request, pubkey string) {
-	cfg, err := s.buildPeerConfig(pubkey)
-	if err != nil {
-		jsonErr(w, err, 404)
+func (s *appServer) handleQR(w http.ResponseWriter, pubkey string) {
+	clientCfg, ok := cfgStore.Get(pubkey)
+	if !ok {
+		w.Header().Set("Content-Type", "application/json")
+		jsonErr(w, fmt.Errorf("config not available — peer was added without key generation"), 404)
 		return
 	}
-	png, err := generateQR(cfg)
+	png, err := generateQR(clientCfg)
 	if err != nil {
+		w.Header().Set("Content-Type", "application/json")
 		jsonErr(w, err, 500)
 		return
 	}
@@ -133,34 +146,19 @@ func (s *server) handleQR(w http.ResponseWriter, r *http.Request, pubkey string)
 	w.Write(png)
 }
 
-func (s *server) handlePeerConfig(w http.ResponseWriter, r *http.Request, pubkey string) {
-	cfg, err := s.buildPeerConfig(pubkey)
-	if err != nil {
-		jsonErr(w, err, 404)
+func (s *appServer) handlePeerConfig(w http.ResponseWriter, pubkey string) {
+	clientCfg, ok := cfgStore.Get(pubkey)
+	if !ok {
+		w.Header().Set("Content-Type", "application/json")
+		jsonErr(w, fmt.Errorf("config not available — peer was added without key generation"), 404)
 		return
 	}
 	w.Header().Set("Content-Type", "text/plain")
 	w.Header().Set("Content-Disposition", "attachment; filename=wg-client.conf")
-	w.Write([]byte(cfg))
+	w.Write([]byte(clientCfg))
 }
 
-func (s *server) buildPeerConfig(pubkey string) (string, error) {
-	iface, peers, err := readConfig(s.cfg.WgConfig)
-	if err != nil {
-		return "", err
-	}
-	for _, p := range peers {
-		if p.PublicKey == pubkey && p.PresharedKey != "" {
-			// we stored the private key at add time — we don't re-derive it
-			// config download only works if private key was returned at creation
-			_ = iface
-			return "", fmt.Errorf("private key not stored — use the config returned at peer creation")
-		}
-	}
-	return "", fmt.Errorf("peer not found or private key unavailable")
-}
-
-func (s *server) handleGenerate(w http.ResponseWriter, r *http.Request) {
+func (s *appServer) handleGenerate(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		w.WriteHeader(405)
 		return
@@ -172,27 +170,34 @@ func (s *server) handleGenerate(w http.ResponseWriter, r *http.Request) {
 		jsonErr(w, err, 500)
 		return
 	}
-
 	priv, pub, psk, err := genKey()
 	if err != nil {
 		jsonErr(w, err, 500)
 		return
 	}
-
 	serverPub := ""
 	if iface != nil {
 		serverPub = iface.PublicKey
 	}
-
 	json.NewEncoder(w).Encode(map[string]string{
-		"private_key":   priv,
-		"public_key":    pub,
-		"preshared_key": psk,
-		"server_pub":    serverPub,
+		"private_key":     priv,
+		"public_key":      pub,
+		"preshared_key":   psk,
+		"server_pub":      serverPub,
 		"server_endpoint": s.cfg.Server.Endpoint,
-		"dns":           s.cfg.Server.DNS,
-		"allowed_ips":   s.cfg.Defaults.AllowedIPs,
+		"dns":             s.cfg.Server.DNS,
+		"allowed_ips":     s.cfg.Defaults.AllowedIPs,
 	})
+}
+
+func (s *appServer) handleSuggestIP(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	ip, err := nextAvailableIP(s.cfg.WgConfig)
+	if err != nil {
+		jsonErr(w, err, 500)
+		return
+	}
+	json.NewEncoder(w).Encode(map[string]string{"ip": ip})
 }
 
 func basicAuth(user, pass string, next http.Handler) http.Handler {

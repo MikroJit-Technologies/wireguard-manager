@@ -16,9 +16,10 @@ func main() {
 		log.Fatalf("config: %v", err)
 	}
 
-	srv := newServer(cfg)
-	log.Printf("wireguard-manager listening on %s (interface: %s)", cfg.ListenAddr, cfg.Interface)
-	if err := http.ListenAndServe(cfg.ListenAddr, srv); err != nil {
+	cfgStore.startCleaner()
+
+	log.Printf("wireguard-manager listening on %s  interface=%s", cfg.ListenAddr, cfg.Interface)
+	if err := http.ListenAndServe(cfg.ListenAddr, newServer(cfg)); err != nil {
 		log.Fatal(err)
 	}
 }

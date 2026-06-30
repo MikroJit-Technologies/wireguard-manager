@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"fmt"
+	"net"
 	"os"
 	"os/exec"
 	"strconv"
@@ -20,45 +21,47 @@ type Peer struct {
 	RxBytes       int64  `json:"rx_bytes"`
 	TxBytes       int64  `json:"tx_bytes"`
 	Online        bool   `json:"online"`
+	HasConfig     bool   `json:"has_config"`
 }
 
-type Interface struct {
+type WGInterface struct {
 	PrivateKey string
 	PublicKey  string
 	Address    string
 	ListenPort string
 	DNS        string
-	PostUp     []string
-	PostDown   []string
 }
 
-// readConfig parses /etc/wireguard/wg0.conf
-func readConfig(path string) (*Interface, []Peer, error) {
+func readConfig(path string) (*WGInterface, []Peer, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return nil, nil, err
 	}
 	defer f.Close()
 
-	var iface Interface
+	var iface WGInterface
 	var peers []Peer
 	var cur *Peer
 
 	scanner := bufio.NewScanner(f)
 	section := ""
 	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
-		if line == "" || strings.HasPrefix(line, "#") {
-			if cur != nil && strings.HasPrefix(line, "# Name = ") {
-				cur.Name = strings.TrimPrefix(line, "# Name = ")
+		line := scanner.Text()
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" {
+			continue
+		}
+		if strings.HasPrefix(trimmed, "#") {
+			if cur != nil && strings.HasPrefix(trimmed, "# Name = ") {
+				cur.Name = strings.TrimPrefix(trimmed, "# Name = ")
 			}
 			continue
 		}
-		if line == "[Interface]" {
+		if trimmed == "[Interface]" {
 			section = "interface"
 			continue
 		}
-		if line == "[Peer]" {
+		if trimmed == "[Peer]" {
 			if cur != nil {
 				peers = append(peers, *cur)
 			}
@@ -66,9 +69,8 @@ func readConfig(path string) (*Interface, []Peer, error) {
 			section = "peer"
 			continue
 		}
-		k, v, _ := strings.Cut(line, " = ")
-		k = strings.TrimSpace(k)
-		v = strings.TrimSpace(v)
+		k, v, _ := strings.Cut(trimmed, " = ")
+		k, v = strings.TrimSpace(k), strings.TrimSpace(v)
 		switch section {
 		case "interface":
 			switch k {
@@ -80,10 +82,6 @@ func readConfig(path string) (*Interface, []Peer, error) {
 				iface.ListenPort = v
 			case "DNS":
 				iface.DNS = v
-			case "PostUp":
-				iface.PostUp = append(iface.PostUp, v)
-			case "PostDown":
-				iface.PostDown = append(iface.PostDown, v)
 			}
 		case "peer":
 			switch k {
@@ -101,43 +99,41 @@ func readConfig(path string) (*Interface, []Peer, error) {
 	if cur != nil {
 		peers = append(peers, *cur)
 	}
-
-	// derive server public key
 	if iface.PrivateKey != "" {
-		pub, err := wgPubKey(iface.PrivateKey)
-		if err == nil {
+		if pub, err := wgPubKey(iface.PrivateKey); err == nil {
 			iface.PublicKey = pub
 		}
 	}
-
 	return &iface, peers, scanner.Err()
 }
 
-// liveStats merges `wg show wg0 dump` into peer list
-func liveStats(iface string, peers []Peer) []Peer {
-	out, err := exec.Command("wg", "show", iface, "dump").Output()
+func liveStats(ifaceName string, peers []Peer) []Peer {
+	out, err := exec.Command("wg", "show", ifaceName, "dump").Output()
 	if err != nil {
 		return peers
 	}
 	stats := map[string][]string{}
-	lines := strings.Split(strings.TrimSpace(string(out)), "\n")
-	for _, l := range lines[1:] { // skip interface line
-		f := strings.Fields(l)
-		if len(f) >= 7 {
-			// pubkey psk endpoint allowed-ips last-handshake rx tx
+	for i, l := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+		if i == 0 {
+			continue
+		}
+		if f := strings.Fields(l); len(f) >= 7 {
 			stats[f[0]] = f
 		}
 	}
+	now := time.Now().Unix()
 	for i := range peers {
 		f, ok := stats[peers[i].PublicKey]
 		if !ok {
 			continue
 		}
-		peers[i].Endpoint = f[2]
+		if f[2] != "(none)" {
+			peers[i].Endpoint = f[2]
+		}
 		peers[i].LastHandshake, _ = strconv.ParseInt(f[4], 10, 64)
 		peers[i].RxBytes, _ = strconv.ParseInt(f[5], 10, 64)
 		peers[i].TxBytes, _ = strconv.ParseInt(f[6], 10, 64)
-		peers[i].Online = time.Now().Unix()-peers[i].LastHandshake < 180
+		peers[i].Online = peers[i].LastHandshake > 0 && now-peers[i].LastHandshake < 180
 	}
 	return peers
 }
@@ -154,54 +150,98 @@ func addPeer(wgConf, name, pubkey, psk, allowedIPs string) error {
 		return err
 	}
 	defer f.Close()
-	_, err = f.WriteString(entry)
-	if err != nil {
+	if _, err = f.WriteString(entry); err != nil {
 		return err
 	}
 
-	// apply to running interface
-	exec.Command("wg", "addconf", interfaceName(wgConf),
-		fmt.Sprintf("<(echo '[Peer]\nPublicKey = %s\nAllowedIPs = %s')", pubkey, allowedIPs)).Run()
-	exec.Command("wg", "set", interfaceName(wgConf), "peer", pubkey, "allowed-ips", allowedIPs).Run()
+	iface := interfaceName(wgConf)
+	exec.Command("wg", "set", iface, "peer", pubkey, "allowed-ips", allowedIPs).Run()
+
+	if psk != "" {
+		tmp, err := os.CreateTemp("", "wg-psk-*")
+		if err == nil {
+			tmp.WriteString(psk)
+			tmp.Close()
+			exec.Command("wg", "set", iface, "peer", pubkey, "preshared-key", tmp.Name()).Run()
+			os.Remove(tmp.Name())
+		}
+	}
 	return nil
 }
 
 func removePeer(wgConf, pubkey string) error {
-	// remove from running interface first
 	exec.Command("wg", "set", interfaceName(wgConf), "peer", pubkey, "remove").Run()
 
-	// rewrite config file without this peer
 	data, err := os.ReadFile(wgConf)
 	if err != nil {
 		return err
 	}
-
-	// block-based removal
 	blocks := strings.Split(string(data), "\n[Peer]")
-	newContent := blocks[0]
+	out := blocks[0]
 	for _, block := range blocks[1:] {
 		if !strings.Contains(block, pubkey) {
-			newContent += "\n[Peer]" + block
+			out += "\n[Peer]" + block
 		}
 	}
-	return os.WriteFile(wgConf, []byte(newContent), 0600)
+	return os.WriteFile(wgConf, []byte(out), 0600)
+}
+
+func nextAvailableIP(wgConf string) (string, error) {
+	iface, peers, err := readConfig(wgConf)
+	if err != nil {
+		return "", err
+	}
+	if iface.Address == "" {
+		return "", fmt.Errorf("interface has no Address configured")
+	}
+	serverIP, ipNet, err := net.ParseCIDR(iface.Address)
+	if err != nil {
+		return "", fmt.Errorf("invalid interface address: %w", err)
+	}
+	used := map[string]bool{serverIP.String(): true}
+	for _, p := range peers {
+		for _, cidr := range strings.Split(p.AllowedIPs, ",") {
+			if ip, _, e := net.ParseCIDR(strings.TrimSpace(cidr)); e == nil {
+				used[ip.String()] = true
+			}
+		}
+	}
+	ip := serverIP.Mask(ipNet.Mask).To4()
+	if ip == nil {
+		return "", fmt.Errorf("only IPv4 supported for auto-IP")
+	}
+	incIP(ip)
+	for ipNet.Contains(ip) {
+		s := ip.String()
+		if !used[s] && !strings.HasSuffix(s, ".0") && !strings.HasSuffix(s, ".255") {
+			return s + "/32", nil
+		}
+		incIP(ip)
+	}
+	return "", fmt.Errorf("no available IPs in %s", ipNet)
+}
+
+func incIP(ip net.IP) {
+	for j := len(ip) - 1; j >= 0; j-- {
+		ip[j]++
+		if ip[j] > 0 {
+			break
+		}
+	}
 }
 
 func genKey() (priv, pub, psk string, err error) {
 	privBytes, err := exec.Command("wg", "genkey").Output()
 	if err != nil {
-		return "", "", "", fmt.Errorf("genkey: %w", err)
+		return "", "", "", fmt.Errorf("wg genkey: %w", err)
 	}
 	priv = strings.TrimSpace(string(privBytes))
-
-	pub, err = wgPubKey(priv)
-	if err != nil {
+	if pub, err = wgPubKey(priv); err != nil {
 		return "", "", "", err
 	}
-
 	pskBytes, err := exec.Command("wg", "genpsk").Output()
 	if err != nil {
-		return "", "", "", fmt.Errorf("genpsk: %w", err)
+		return "", "", "", fmt.Errorf("wg genpsk: %w", err)
 	}
 	psk = strings.TrimSpace(string(pskBytes))
 	return priv, pub, psk, nil
@@ -212,7 +252,7 @@ func wgPubKey(privKey string) (string, error) {
 	cmd.Stdin = strings.NewReader(privKey)
 	out, err := cmd.Output()
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("wg pubkey: %w", err)
 	}
 	return strings.TrimSpace(string(out)), nil
 }
