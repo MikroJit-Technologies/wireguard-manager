@@ -1,0 +1,15 @@
+services:
+  wireguard-manager:
+    image: ghcr.io/mikrojit-technologies/wireguard-manager:latest
+    container_name: wireguard-manager
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./config.yml:/app/config.yml:ro
+      - /etc/wireguard:/etc/wireguard
+    cap_add:
+      - NET_ADMIN
+    network_mode: host
+    environment:
+      - TZ=Asia/Bangkok

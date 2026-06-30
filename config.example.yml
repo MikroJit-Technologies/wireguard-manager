@@ -1,0 +1,16 @@
+listen_addr: ":8080"
+interface: "wg0"
+wg_config: "/etc/wireguard/wg0.conf"
+
+server:
+  endpoint: "vpn.example.com:51820"  # shown in generated client configs
+  dns: "1.1.1.1"                      # DNS for clients
+
+defaults:
+  allowed_ips: "0.0.0.0/0, ::/0"     # full tunnel
+  mtu: 1420
+
+# optional basic auth
+auth:
+  username: ""
+  password: ""
